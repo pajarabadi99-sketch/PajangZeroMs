@@ -1,0 +1,441 @@
+
+local G = (getgenv and getgenv()) or _G
+for _, key in ipairs({ "__KzoyzOpus", "__GTFarm", "__ZekioSupremeTest" }) do -- lepas sesi utama lama dan tes sebelum menggantinya
+    if G[key] and G[key].Cleanup then pcall(G[key].Cleanup) end
+    G[key] = nil
+end
+local Session = {}
+G.__KzoyzOpus = Session
+local function alive()
+    return G.__KzoyzOpus == Session and not Session.Failed
+end
+
+-- Startup utama berjalan tanpa panel diagnostik; kegagalan dicatat di console.
+do (function()
+    Session.Stage = "Memulai Zekio supreme v5.9.25"
+    function Session.GuiParent(fallback)
+        if not fallback then
+            local p = game:GetService("Players").LocalPlayer
+            fallback = p and (p:FindFirstChildOfClass("PlayerGui") or p:FindFirstChild("PlayerGui"))
+        end
+        local root = fallback
+        if type(gethui) == "function" then
+            local ok, value = pcall(gethui)
+            if ok and value then root = value end
+        end
+        if root then
+            local probe = Instance.new("ScreenGui")
+            local ok = pcall(function() probe.Parent = root end)
+            pcall(function() probe:Destroy() end)
+            if ok then return root end
+        end
+        assert(fallback, "PlayerGui belum tersedia; tunggu game selesai masuk")
+        return fallback
+    end
+    function Session.Report(message)
+        Session.Stage = tostring(message)
+    end
+    function Session.ResetPartial()
+        if Session.UnbindInput then pcall(Session.UnbindInput) end
+        for _, c in ipairs(Session.StartupConnections or {}) do pcall(function() c:Disconnect() end) end
+        for _, g in ipairs(Session.StartupGuis or {}) do pcall(function() g:Destroy() end) end
+        if Session.StartupWindow then pcall(function() Session.StartupWindow:Destroy() end) end
+    end
+    function Session.FailStartup(message)
+        Session.Failed = true
+        Session.ResetPartial()
+        warn("[Zekio supreme] Startup gagal pada " .. tostring(Session.Stage) .. ": " .. tostring(message))
+    end
+    Session.Cleanup = Session.ResetPartial
+end)() end
+
+local startupOk, startupError = xpcall(function()
+do
+    local getId = getthreadidentity or get_thread_identity or getidentity or (syn and syn.get_thread_identity)
+    if type(getId) == "function" then pcall(function() Session.Ident = getId() end) end
+    Session.Exec = coroutine.create(function(job)
+        while true do
+            job.ok, job.err = pcall(job.fn)
+            job.done = true
+            Session.ExecBusy = false
+            job = coroutine.yield()
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- SERVICES & MODULE GAME
+---------------------------------------------------------------------
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+Session.Report("Menunggu PlayerGui")
+assert(LocalPlayer, "Masuk ke game Roblox terlebih dahulu")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 15)
+assert(PlayerGui, "PlayerGui belum tersedia setelah 15 detik; masuk world lalu execute ulang")
+
+-- Cari dependensi tanpa menunggu satu lokasi folder selamanya.
+local Shared = (function()
+    local boot = { Modules = {}, Errors = {}, Sources = {}, Missing = {}, Version = "startup r10" }
+    local wanted = { itemdb = true, inventory = true, net = true, particles = true,
+        worldmenu = true, roles = true, sfx = true, splice = true }
+    local seen, containers, remotes, gameGui = {}, {}, nil, nil
+
+    local function note(text)
+        Session.Report("Data game: " .. tostring(text))
+    end
+    local function field(v, k)
+        local ok, value = pcall(function() return v[k] end)
+        if ok then return value end
+    end
+    local function path(node)
+        local ok, value = pcall(function() return node:GetFullName() end)
+        return ok and tostring(value) or tostring(field(node, "Name") or "modul")
+    end
+    local function inspect(node)
+        if seen[node] then return end
+        seen[node] = true
+        local name = field(node, "Name")
+        if type(name) ~= "string" then return end
+        local key = string.lower(name)
+        if key == "worldremotes" and not remotes then remotes = node end
+        if key == "gamegui" and not gameGui then gameGui = node end
+        if not wanted[key] then return end
+        local ok, isModule = pcall(function() return node:IsA("ModuleScript") end)
+        if not (ok and isModule) then return end
+        local list = boot.Modules[key]
+        if not list then list = {}; boot.Modules[key] = list end
+        if #list < 8 then list[#list + 1] = node end
+    end
+
+    local old = ReplicatedStorage:FindFirstChild("Shared")
+    if old then
+        local ok, children = pcall(function() return old:GetChildren() end)
+        if ok then for _, node in ipairs(children) do inspect(node) end end
+    end
+    containers[#containers + 1] = ReplicatedStorage
+    containers[#containers + 1] = PlayerGui
+    local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    if scripts then containers[#containers + 1] = scripts end
+    local okFirst, first = pcall(game.GetService, game, "ReplicatedFirst")
+    if okFirst and first then containers[#containers + 1] = first end
+    note("mencari modul yang tersedia")
+    for _, root in ipairs(containers) do
+        inspect(root)
+        local ok, descendants = pcall(function() return root:GetDescendants() end)
+        if ok and type(descendants) == "table" then
+            for i, node in ipairs(descendants) do
+                inspect(node)
+                if i % 400 == 0 then task.wait() end
+            end
+        end
+    end
+    for _, enumerate in ipairs({ getloadedmodules or false, getnilinstances or false }) do
+        if type(enumerate) == "function" then
+            local ok, nodes = pcall(enumerate)
+            if ok and type(nodes) == "table" then
+                for _, node in pairs(nodes) do inspect(node) end
+            end
+        end
+    end
+
+    function boot:FindFirstChild(name)
+        local list = self.Modules[string.lower(tostring(name))]
+        return list and list[1] or nil
+    end
+    function boot.catalog(value)
+        if type(value) ~= "table" then return false end
+        local count, checked = 0, 0
+        for id, entry in next, value do
+            checked = checked + 1
+            if type(id) == "number" and type(entry) == "table"
+                and type(rawget(entry, "name")) == "string"
+                and (type(rawget(entry, "hits")) == "number" or type(rawget(entry, "solid")) == "boolean"
+                    or type(rawget(entry, "grow")) == "number") then
+                count = count + 1
+                if count >= 3 then return true end
+            end
+            if checked >= 64 then break end
+        end
+        return false
+    end
+    function boot.network(value)
+        if type(value) ~= "table" then return false end
+        local tile, act = rawget(value, "tile"), rawget(value, "act")
+        return type(tile) == "table" and type(field(tile, "send")) == "function"
+            and type(act) == "table" and type(field(act, "send")) == "function"
+    end
+    local function requireBounded(node)
+        if not (task and type(task.spawn) == "function" and type(task.wait) == "function") then
+            return false, "task.spawn / task.wait tidak tersedia"
+        end
+        local job = { done = false }
+        local thread = task.spawn(function()
+            job.ok, job.value = pcall(require, node)
+            job.done = true
+        end)
+        local start = os.clock()
+        while not job.done and os.clock() - start < 3 do task.wait() end
+        if not job.done then
+            if type(task.cancel) == "function" then pcall(task.cancel, thread) end
+            return false, "require melewati batas 3 detik"
+        end
+        return job.ok, job.value
+    end
+    local function import(name, validate)
+        local candidates = boot.Modules[string.lower(name)] or {}
+        for _, node in ipairs(candidates) do
+            note("memuat " .. name .. " dari " .. path(node))
+            local ok, value = requireBounded(node)
+            if ok and type(value) == "table" and (not validate or validate(value)) then
+                boot.Sources[name] = path(node)
+                return true, value
+            end
+            boot.Errors[#boot.Errors + 1] = name .. " @ " .. path(node) .. ": "
+                .. (ok and "format modul tidak cocok" or tostring(value))
+        end
+        return false, nil
+    end
+    function boot:Load(name)
+        return import(name)
+    end
+
+    local itemOK
+    itemOK, boot.ItemDB = import("ItemDB", boot.catalog)
+    boot.InventoryOK, boot.Inventory = import("Inventory")
+    boot.NetOK, boot.Net = import("Net", boot.network)
+    boot.ParticlesOK, boot.Particles = import("Particles")
+    boot.MenuOK, boot.Menu = import("WorldMenu")
+    boot.RolesOK, boot.Roles = import("Roles")
+    boot.SfxOK, boot.Sfx = import("Sfx")
+    -- Modul dapat dilepas dari tree setelah dimuat. Cek bentuk data yang dipakai
+    -- script, tanpa require() semua ModuleScript yang tidak dikenal.
+    if (not itemOK or not boot.NetOK) and type(getgc) == "function" then
+        note("mencari data item / jaringan yang sudah dimuat game")
+        local ok, objects = pcall(getgc, true)
+        if ok and type(objects) == "table" then
+            local function consider(value, label)
+                if type(value) ~= "table" or value == G or value == _G or value == boot then return end
+                if not itemOK and boot.catalog(value) then
+                    itemOK, boot.ItemDB = true, value
+                    boot.Sources.ItemDB = label
+                end
+                if not boot.NetOK and boot.network(value) then
+                    boot.NetOK, boot.Net = true, value
+                    boot.Sources.Net = label
+                end
+            end
+            local checked = 0
+            for _, value in pairs(objects) do
+                consider(value, "data game yang sudah dimuat (getgc)")
+                checked = checked + 1
+                if itemOK and boot.NetOK then break end
+                if checked % 300 == 0 then task.wait() end
+            end
+            -- Beberapa executor hanya mengekspos fungsi, sementara data modulnya
+            -- masih dapat dibaca melalui upvalue fungsi game yang sudah berjalan.
+            if not itemOK or not boot.NetOK then
+                note("menelusuri data modul yang ditangkap fungsi game")
+                local bulk = getupvalues or (debug and debug.getupvalues)
+                local single = getupvalue or (debug and debug.getupvalue)
+                for _, fn in pairs(objects) do
+                    if type(fn) == "function" then
+                        local values
+                        if type(bulk) == "function" then
+                            local okValues, found = pcall(bulk, fn)
+                            if okValues and type(found) == "table" then values = found end
+                        end
+                        if values then
+                            for _, value in pairs(values) do consider(value, "upvalue fungsi game") end
+                        elseif type(single) == "function" then
+                            for i = 1, 40 do
+                                local okValue, first, second = pcall(single, fn, i)
+                                if not okValue or (first == nil and second == nil) then break end
+                                consider(second ~= nil and second or first, "upvalue fungsi game")
+                            end
+                        end
+                    end
+                    checked = checked + 1
+                    if itemOK and boot.NetOK then break end
+                    if checked % 200 == 0 then task.wait() end
+                end
+            end
+        end
+    end
+    boot.Inventory = boot.Inventory or {}
+    boot.GameGui = gameGui or PlayerGui
+    boot.Remotes = remotes
+    if not remotes then
+        boot.EmptyRemotes = Instance.new("Folder")
+        boot.EmptyRemotes.Name = "ZekioNoLegacyRemotes"
+        boot.Remotes = boot.EmptyRemotes
+    end
+    for _, entry in ipairs({ {"Inventory", boot.InventoryOK}, {"Net", boot.NetOK},
+        {"Particles", boot.ParticlesOK}, {"WorldMenu", boot.MenuOK}, {"Roles", boot.RolesOK}, {"Sfx", boot.SfxOK} }) do
+        if not entry[2] then boot.Missing[#boot.Missing + 1] = entry[1] end
+    end
+    boot.Status = "ItemDB: " .. tostring(boot.Sources.ItemDB or "belum ditemukan")
+        .. (#boot.Missing > 0 and (" | modul opsional belum terbaca: " .. table.concat(boot.Missing, ", ")) or "")
+    if not itemOK then
+        local names = {}
+        for name, candidates in pairs(boot.Modules) do
+            if #candidates > 0 then names[#names + 1] = name .. " @ " .. path(candidates[1]) end
+        end
+        table.sort(names)
+        local message = "ItemDB belum ditemukan. Script tidak akan menunggu Shared tanpa batas.\n"
+            .. "Modul terbaca: " .. (#names > 0 and table.concat(names, "; ") or "tidak ada nama modul lama")
+            .. (#boot.Errors > 0 and ("\n" .. table.concat(boot.Errors, "\n")) or "")
+        note(message)
+        if boot.EmptyRemotes then boot.EmptyRemotes:Destroy() end
+        error(message, 0)
+    end
+    note(boot.Status)
+    return boot
+end)()
+local WorldRemotes = Shared.Remotes
+local SetTileRemote = WorldRemotes:FindFirstChild("SetTile")
+local ItemDB = Shared.ItemDB
+local InventoryModule = Shared.Inventory
+local NetOk, Net = Shared.NetOK, Shared.Net
+local GameGui = Shared.GameGui
+local ParticlesOk, ParticlesModule = Shared.ParticlesOK, Shared.Particles
+local MenuModOk, MenuModule = Shared.MenuOK, Shared.Menu
+local RolesOk, RolesModule = Shared.RolesOK, Shared.Roles
+local SfxOk, SfxModule = Shared.SfxOK, Shared.Sfx
+
+local WindUI = (function()
+    local urls = {
+        "https://github.com/Footagesus/WindUI/releases/download/1.6.66/main.lua",
+        "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+    }
+    local failures = {}
+    for i, url in ipairs(urls) do
+        Session.Report(("Mengunduh UI (%d/%d)"):format(i, #urls))
+        local job = { done = false }
+        local thread = task.spawn(function()
+            job.ok, job.body = pcall(game.HttpGet, game, url)
+            job.done = true
+        end)
+        local at = os.clock()
+        while not job.done and alive() and os.clock() - at < 12 do task.wait(0.05) end
+        if not alive() then error("Sesi tes sudah diganti / ditutup", 0) end
+        if not job.done then
+            if type(task.cancel) == "function" then pcall(task.cancel, thread) end
+            failures[#failures + 1] = "Jalur " .. i .. ": HTTP melewati 12 detik"
+        elseif not job.ok or type(job.body) ~= "string" or #job.body < 1000 then
+            failures[#failures + 1] = "Jalur " .. i .. ": " .. tostring(job.body):sub(1, 150)
+        else
+            Session.Report("Memuat pustaka UI dari jalur " .. i)
+            local chunk, compileError = loadstring(job.body, "=ZekioWindUI")
+            if chunk then
+                -- Fallback parent hanya untuk pustaka UI ini; fungsi gethui
+                -- global milik executor tidak diubah.
+                if type(getfenv) == "function" and type(setfenv) == "function" then
+                    local okEnv, environment = pcall(getfenv, chunk)
+                    if okEnv and type(environment) == "table" then
+                        local uiEnvironment = setmetatable({
+                            gethui = function() return Session.GuiParent(PlayerGui) end,
+                        }, { __index = environment, __newindex = environment })
+                        pcall(setfenv, chunk, uiEnvironment)
+                    end
+                end
+                local ok, library = pcall(chunk)
+                if ok and type(library) == "table" and type(library.CreateWindow) == "function" then return library end
+                failures[#failures + 1] = "Jalur " .. i .. ": " .. tostring(library):sub(1, 180)
+            else
+                failures[#failures + 1] = "Jalur " .. i .. ": " .. tostring(compileError):sub(1, 180)
+            end
+        end
+    end
+    error("WindUI gagal dimuat. " .. table.concat(failures, " | "), 0)
+end)()
+
+---------------------------------------------------------------------
+-- PENGATURAN & DATA
+---------------------------------------------------------------------
+local State = {
+    Running = false,
+    Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
+    PlaceMs = 250,                -- jeda setelah tiap place
+    BreakMs = 220,                -- jeda tiap pukulan (normal 220)
+    AfterBreakMs = 300,           -- jeda setelah block hancur
+    HitsOverride = 0,             -- jumlah pukulan manual (0 = otomatis)
+    BreakBackground = true,       -- selalu ikut pecah background (tanpa tombol)
+    MultiTarget = 1,              -- jumlah tile dipukul bergantian (1 = biasa)
+    SelectedId = nil,
+    Offsets = {},                 -- tile yang dipilih di Grid
+    CalibX = 0,
+    CalibY = 0,
+    AntiAfk = true,
+    MutePunch = true,
+    Visual = true,                -- animasi tangan saat break / place / tanam / panen (tampilan saja)
+    LiteMode = false,
+    AutoCollect = true,           -- ambil drop di tile yang dipilih
+    CollectAround = false,        -- ambil drop di sekitar karakter (radius) kapan saja
+    CollectRadius = 3,            -- jari-jari collect (tile), dipakai mode Remote
+    CollectMode = "Sentuhan",     -- "Sentuhan" (badan, seperti main manual) / "Remote" (ambil dari jauh, cara lama)
+    Override = nil,               -- Pabrik memakai tile & block sendiri
+    Quiet = false,                -- tanpa notifikasi (dipakai Pabrik)
+    Cycles = 0,
+    Placed = 0,
+    Broken = 0,
+    Collected = 0,                -- jumlah drop yang diambil
+    CollectFail = 0,              -- jumlah drop yang ditolak server
+    LastAction = "-",
+    SeedDrop = false,             -- seed hasil break sudah banyak -> drop ke titik drop
+    SeedDropAt = 190,             -- drop kalau seed sudah sebanyak ini
+    SeedKeep = 0,                 -- seed yang disisakan
+    Dropped = 0,
+    DropPause = false,            -- Auto Farm dijeda sementara (sedang pergi drop)
+}
+
+local Misc = {
+    Speed = 100,      -- walkspeed % (100 = normal)
+    InfJump = false,
+    Ghost = false,    -- fly + tembus block
+    UpHeld = false,   -- tombol ▲ di layar ditahan
+    DownHeld = false, -- tombol ▼ di layar ditahan
+    CustomName = true,          -- watermark nama (selalu aktif, mati hanya saat script ditutup)
+    NameText = "Zekio supreme",  -- teks watermark
+}
+
+-- Auto Clear World
+local Clear = {
+    Running = false,
+    IncludeBg = true,         -- ikut pecah background
+    UseBlock = true,          -- taruh block kalau tidak ada pijakan
+    ScaffoldId = nil,         -- block yang dipakai untuk pijakan
+    Collect = true,           -- ambil drop tiap habis pecah
+    Sweep = "Kiri → Kanan",   -- "Kiri → Kanan" atau "Zig-zag"
+    Skip = {},                -- tile yang dilewati sementara
+    TopRow = -1,              -- baris yang sedang dibersihkan
+    DirRow = nil,             -- arah zig-zag untuk baris ini
+    Dir = nil,
+    Broken = 0,
+    Remaining = -1,
+    Status = "-",
+}
+
+-- Auto Splice: tanam Seed A lalu splice Seed B
+local Splice = {
+    Running = false,
+    Roam = true,        -- keliling world pakai A* (false = hanya tile Grid)
+    Roaming = false,
+    A = nil,
+    B = nil,
+    Ms = 300,
+    Made = 0,
+    Planted = 0,
+    Fail = {},
+    Skip = {},
+    Status = "-",
+    Row = {},           -- baris yang sedang dikerjakan (rapi per baris)
+}
+
+-- Lahan (farm world): baris block dari atas ke bawah
+local Land = {
+    X0 = 0, X1 = 99,  -- kolom awal & akhir
+    Y0 = 2
